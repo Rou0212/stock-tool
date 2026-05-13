@@ -173,7 +173,7 @@ tr:hover td { background: #fafafa; }
 <body>
 <div class="container">
   <h1>台股工具箱</h1>
-  <div class="subtitle">即時抓取Yahoo Finance API 的最新交易資料 · 資料 © 證交所、櫃買中心</div>
+  <div class="subtitle">即時抓取證交所 OpenAPI 的最新交易資料 · 資料 © 證交所、櫃買中心</div>
 
   <div class="tabs">
     <button class="tab-btn active" data-tab="portfolio">📊 我的資產組合</button>
@@ -184,6 +184,10 @@ tr:hover td { background: #fafafa; }
 
   <!-- ============= 資產組合 ============= -->
   <div class="panel active" id="panel-portfolio">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px">
+      <div style="font-size:12px; color:#6b7280" id="price-stamp">&nbsp;</div>
+      <button class="secondary" id="refresh-prices">🔄 重新整理即時報價</button>
+    </div>
     <div class="summary-grid">
       <div class="stat"><div class="label">總投入成本</div><div class="value" id="sum-cost">--</div></div>
       <div class="stat"><div class="label">目前總市值</div><div class="value" id="sum-value">--</div></div>
@@ -543,6 +547,56 @@ async function loadAllData() {
 }
 
 // ============================================================
+//  MIS 準即時報價（給持股用，盤中有效，延遲約 20 秒）
+// ============================================================
+async function fetchRealtimePrices(codes) {
+  if (!codes.length) return;
+  // 不知道是上市還上櫃時兩個 prefix 都試
+  const params = codes.flatMap(code => {
+    const s = stockMap[code];
+    if (s && s.market === 'OTC') return [`otc_${code}.tw`];
+    if (s && s.market === 'TSE') return [`tse_${code}.tw`];
+    return [`tse_${code}.tw`, `otc_${code}.tw`];
+  }).join('|');
+  const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(params)}&json=1&delay=0`;
+  try {
+    const data = await fetchJSON(url);
+    if (!data || !data.msgArray) return 0;
+    let updated = 0;
+    for (const item of data.msgArray) {
+      const code = item.c;
+      if (!code) continue;
+      const isOtc = (item.ch || '').startsWith('otc');
+      // 取最新成交價 z，盤前/盤後可能是 "-"
+      let price = parseFloat(item.z);
+      // 盤前用昨收 y 當保底
+      if (isNaN(price) || price <= 0) price = parseFloat(item.y);
+      const yClose = parseFloat(item.y);
+      if (!stockMap[code]) {
+        stockMap[code] = { code, name: item.n, market: isOtc ? 'OTC' : 'TSE' };
+      }
+      if (!isNaN(price) && price > 0) {
+        stockMap[code].price = price;
+        if (!isNaN(yClose) && yClose > 0) {
+          const ch = price - yClose;
+          stockMap[code].change = ch;
+          stockMap[code].changePct = ch / yClose * 100;
+        }
+        // 即時量 v：累計成交張數
+        const v = parseFloat(item.v);
+        if (!isNaN(v) && v > 0) stockMap[code].volume = v;
+        stockMap[code].realtime = true;
+        updated++;
+      }
+    }
+    return updated;
+  } catch (e) {
+    console.warn('MIS realtime fetch failed:', e);
+    return 0;
+  }
+}
+
+// ============================================================
 //  Portfolio
 // ============================================================
 function savePortfolio() {
@@ -708,7 +762,7 @@ function drawPnLChart(rows) {
 // ============================================================
 //  Add holding
 // ============================================================
-document.getElementById('add-btn').addEventListener('click', () => {
+document.getElementById('add-btn').addEventListener('click', async () => {
   const code = document.getElementById('add-code').value.trim();
   const shares = parseInt(document.getElementById('add-shares').value);
   const cost = parseFloat(document.getElementById('add-cost').value);
@@ -730,6 +784,9 @@ document.getElementById('add-btn').addEventListener('click', () => {
   document.getElementById('add-code').value = '';
   document.getElementById('add-shares').value = '';
   document.getElementById('add-cost').value = '';
+  // 抓即時報價
+  await fetchRealtimePrices([code]);
+  renderPortfolio();
 });
 
 // CSV upload
@@ -737,7 +794,7 @@ document.getElementById('csv-file').addEventListener('change', e => {
   const file = e.target.files[0];
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = ev => {
+  reader.onload = async ev => {
     const text = ev.target.result;
     const lines = text.split(/\r?\n/).filter(l => l.trim());
     let added = 0, skipped = 0;
@@ -763,6 +820,9 @@ document.getElementById('csv-file').addEventListener('change', e => {
     renderPortfolio();
     alert(`已加入 ${added} 檔${skipped ? `，跳過 ${skipped} 行` : ''}`);
     e.target.value = '';
+    // 抓即時報價
+    await fetchRealtimePrices(portfolio.map(p => p.code));
+    renderPortfolio();
   };
   reader.readAsText(file, 'UTF-8');
 });
@@ -973,10 +1033,41 @@ function renderScreenerResults() {
 // ============================================================
 //  Init
 // ============================================================
+function updatePriceStamp(n) {
+  const el = document.getElementById('price-stamp');
+  if (!el) return;
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2, '0');
+  const mm = String(now.getMinutes()).padStart(2, '0');
+  if (n > 0) {
+    el.innerHTML = `🟢 持股報價已更新（${n} 檔，${hh}:${mm}，MIS 延遲約 20 秒）`;
+  } else {
+    el.innerHTML = `<span style="color:#9ca3af">⚪ 即時報價暫無資料（可能盤前 / 盤後 / 假日，現價顯示為昨收）</span>`;
+  }
+}
+
+document.getElementById('refresh-prices').addEventListener('click', async () => {
+  const btn = document.getElementById('refresh-prices');
+  btn.disabled = true; btn.textContent = '更新中…';
+  try {
+    if (portfolio.length) {
+      const n = await fetchRealtimePrices(portfolio.map(p => p.code));
+      updatePriceStamp(n);
+    }
+    renderPortfolio();
+  } finally {
+    btn.disabled = false; btn.textContent = '🔄 重新整理即時報價';
+  }
+});
+
 (async function init() {
   renderPortfolio();
   await loadAllData();
-  renderPortfolio(); // 重新渲染以套上最新價格
+  if (portfolio.length) {
+    const n = await fetchRealtimePrices(portfolio.map(p => p.code));
+    updatePriceStamp(n);
+  }
+  renderPortfolio();
 })();
 </script>
 </body>
