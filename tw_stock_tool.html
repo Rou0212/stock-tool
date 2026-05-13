@@ -411,10 +411,35 @@ function setStatus(html, type='loading') {
   status.innerHTML = html ? `<div class="${type}">${html}</div>` : '';
 }
 
+// 證交所 / 櫃買中心的 API 不一定開放 CORS，所以先試直接抓，失敗再走公開代理
+const CORS_PROXIES = [
+  url => 'https://corsproxy.io/?' + encodeURIComponent(url),
+  url => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+  url => 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(url)
+];
+
 async function fetchJSON(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
-  return res.json();
+  // 1. 直接抓（如果 API 有開 CORS 就最快）
+  try {
+    const res = await fetch(url, { mode: 'cors' });
+    if (res.ok) {
+      const txt = await res.text();
+      if (txt) return JSON.parse(txt);
+    }
+  } catch (e) { /* CORS or network — 落到下面的代理 */ }
+
+  // 2. 依序嘗試公開 CORS 代理
+  let lastErr;
+  for (const wrap of CORS_PROXIES) {
+    try {
+      const res = await fetch(wrap(url));
+      if (!res.ok) { lastErr = new Error('HTTP ' + res.status); continue; }
+      const txt = await res.text();
+      if (!txt) { lastErr = new Error('empty body'); continue; }
+      return JSON.parse(txt);
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('全部代理都失敗');
 }
 
 function num(v) {
@@ -513,7 +538,7 @@ async function loadAllData() {
       setTimeout(() => setStatus(''), 3500);
     }
   } catch (err) {
-    setStatus(`❌ 資料讀取失敗：${err.message}<br>常見原因：證交所假日休市、API 暫時無回應，或瀏覽器擋住跨來源請求。請稍後重試。`, 'error');
+    setStatus(`❌ 資料讀取失敗：${err.message}<br>常見原因：證交所假日休市、API 暫時無回應，或公開 CORS 代理都暫時不可用。請過幾分鐘重試。`, 'error');
   }
 }
 
